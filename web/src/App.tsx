@@ -8,6 +8,7 @@ type Job = {
   address: string;
   status: string;
   error: string;
+  runId: string;
   filename: string;
   checklist: Step[];
 };
@@ -48,6 +49,26 @@ export function App() {
       .then(setJobs)
       .catch((err: Error) => setError(err.message));
   }, [me]);
+
+  // While the worker runs, refresh the open sheet every second so the
+  // checklist moves without a reload. The timer stops as soon as the sheet
+  // leaves "running", or when another sheet is opened.
+  const openId = selected?.id;
+  const openStatus = selected?.status;
+  useEffect(() => {
+    if (!openId || openStatus !== "running") {
+      return;
+    }
+    const timer = setInterval(() => {
+      api<Job>("/api/jobs/" + openId)
+        .then((job) => {
+          setSelected(job);
+          setJobs((current) => current.map((item) => (item.id === job.id ? job : item)));
+        })
+        .catch((err: Error) => setError(err.message));
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [openId, openStatus]);
 
   if (!ready) {
     return <p className="muted">Loading…</p>;
@@ -222,31 +243,67 @@ function Sheet({
   onChange: (job: Job) => void;
   onError: (message: string) => void;
 }) {
+  const [starting, setStarting] = useState(false);
+
   async function start() {
     onError("");
+    setStarting(true);
     try {
       const next = await api<Job>("/api/jobs/" + job.id + "/start", { method: "POST" });
       onChange(next);
     } catch (err) {
       onError(err instanceof Error ? err.message : "Could not start the sheet");
+    } finally {
+      setStarting(false);
     }
   }
 
+  // The worker marks steps done one at a time; the page polls while the sheet
+  // runs (see App), so this view only has to draw what the sheet says.
+  const done = job.checklist.filter((step) => step.state === "done").length;
+  const active = job.status === "running" ? job.checklist.findIndex((step) => step.state === "pending") : -1;
+  const progress = job.checklist.length ? (done / job.checklist.length) * 100 : 0;
+
   return (
     <article className="sheet">
-      <h2>{job.title}</h2>
-      <p>{job.address}</p>
-      <p className={"status " + job.status}>{job.status}</p>
-      {job.filename ? <p className="muted">{job.filename}</p> : null}
+      <header className="sheet-head">
+        <div>
+          <h2>{job.title}</h2>
+          <p className="muted">{job.address}</p>
+        </div>
+        <span className={"status " + job.status}>{job.status}</span>
+      </header>
+      {job.filename ? <p className="file">{job.filename}</p> : null}
       {job.error ? <p className="error">{job.error}</p> : null}
-      <ol>
-        {job.checklist.map((step) => (
-          <li key={step.label} className={step.state}>
-            {step.label}
-          </li>
-        ))}
+      <div className="track" aria-hidden="true">
+        <div className="track-fill" style={{ width: progress + "%" }} />
+      </div>
+      <ol className="steps" aria-label="Checklist">
+        {job.checklist.map((step, index) => {
+          const state = step.state === "done" ? "done" : index === active ? "active" : "pending";
+          return (
+            <li key={step.label} className={"step " + state}>
+              <span className="mark" aria-hidden="true">
+                {state === "done" ? "\u2713" : state === "active" ? "" : index + 1}
+              </span>
+              <span className="step-label">{step.label}</span>
+              {state === "active" ? <span className="sr-only">in progress</span> : null}
+            </li>
+          );
+        })}
       </ol>
-      {job.status === "draft" ? <button onClick={start}>Start</button> : null}
+      {job.status === "draft" ? (
+        <p className="muted">
+          {job.filename ? "Ready to run. Start walks the sheet through the three steps." : "Attach a brochure, then start the sheet."}
+        </p>
+      ) : null}
+      {job.status === "draft" ? (
+        <button onClick={start} disabled={starting}>
+          {starting ? "Starting\u2026" : "Start"}
+        </button>
+      ) : null}
+      {job.status === "running" ? <p className="muted">The worker is on it. This page updates by itself.</p> : null}
+      {job.status === "success" ? <p className="done-note">All three steps are done. The sheet is published.</p> : null}
     </article>
   );
 }

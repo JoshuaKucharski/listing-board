@@ -35,7 +35,7 @@ type Job struct {
 	Filename  string    `json:"filename"`
 	Checklist []Step    `json:"checklist"`
 	CreatedAt time.Time `json:"createdAt"`
-	UpdatedAt time.Time `json:"updatedAt"`
+	UpdatedAt time.Time `json:"-"`
 }
 
 func NewChecklist() []Step {

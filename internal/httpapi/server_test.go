@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -20,7 +21,7 @@ import (
 	"listingboard/internal/board"
 )
 
-func TestStartMarksTheJobSuccessful(t *testing.T) {
+func TestStartMovesTheJobToRunning(t *testing.T) {
 	srv, _ := newTestServer(t)
 	cookie := signUp(t, srv, "ada@example.com")
 	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
@@ -31,28 +32,53 @@ func TestStartMarksTheJobSuccessful(t *testing.T) {
 		t.Fatalf("status %d: %s", res.Code, res.Body.String())
 	}
 	got := decodeJob(t, res)
-	if got.Status != "success" {
-		t.Fatalf("status %s, want success", got.Status)
+	if got.Status != "running" {
+		t.Fatalf("status %s, want running", got.Status)
 	}
 	if got.RunID == "" {
 		t.Fatal("runId is empty")
 	}
 	for _, step := range got.Checklist {
-		if step.State != "done" {
-			t.Fatalf("step %q is %s", step.Label, step.State)
+		if step.State != "pending" {
+			t.Fatalf("step %q is %s, want pending", step.Label, step.State)
 		}
+	}
+
+	// Starting the same sheet again while it runs is harmless and keeps the runId.
+	res = call(srv, http.MethodPost, "/api/jobs/"+job.ID+"/start", cookie, nil, "")
+	if res.Code != http.StatusOK {
+		t.Fatalf("second start %d: %s", res.Code, res.Body.String())
+	}
+	if again := decodeJob(t, res); again.RunID != got.RunID {
+		t.Fatalf("runId changed from %s to %s", got.RunID, again.RunID)
 	}
 }
 
-func TestUploadKeepsTheClientFilename(t *testing.T) {
+func TestUploadStoresTheBodyUnderUserAndJob(t *testing.T) {
 	srv, dir := newTestServer(t)
 	cookie := signUp(t, srv, "ada@example.com")
+	userID := whoAmI(t, srv, cookie)
 	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
-	uploadFile(t, srv, cookie, job.ID, "brochure.pdf", []byte("%PDF-1.4\n"), "application/pdf")
+	content := []byte("Market loft, 10 Market Street. Two bedrooms, river view.\n")
+	uploadFile(t, srv, cookie, job.ID, "../../escaped.txt", content, "text/plain")
 
-	path := filepath.Join(dir, job.ID, "brochure.pdf")
-	if _, err := os.Stat(path); err != nil {
+	path := filepath.Join(dir, userID, job.ID, "body")
+	data, err := os.ReadFile(path)
+	if err != nil {
 		t.Fatalf("brochure was not stored at %s: %v", path, err)
+	}
+	if !bytes.Equal(data, content) {
+		t.Fatal("stored bytes differ from the upload")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "..", "..", "escaped.txt")); err == nil {
+		t.Fatal("the client filename escaped the data directory")
+	}
+	if files := filesUnder(t, dir); len(files) != 1 || files[0] != path {
+		t.Fatalf("data dir holds %v, want only %s", files, path)
+	}
+	res := call(srv, http.MethodGet, "/api/jobs/"+job.ID, cookie, nil, "")
+	if got := decodeJob(t, res); got.Filename != "../../escaped.txt" {
+		t.Fatalf("filename %q, want the client name kept as data", got.Filename)
 	}
 }
 
@@ -85,6 +111,206 @@ func TestStartRequiresASession(t *testing.T) {
 	}
 }
 
+func TestStartWithoutABrochureReturns400(t *testing.T) {
+	srv, _ := newTestServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+
+	res := call(srv, http.MethodPost, "/api/jobs/"+job.ID+"/start", cookie, nil, "")
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400", res.Code)
+	}
+	if msg := errorText(t, res); msg != "Attach a brochure first" {
+		t.Fatalf("error %q, want %q", msg, "Attach a brochure first")
+	}
+}
+
+func TestOnlyOneSheetPerAccountRunsAtATime(t *testing.T) {
+	srv, _ := newTestServer(t)
+	ada := signUp(t, srv, "ada@example.com")
+	first := createSheet(t, srv, ada, "Market loft", "10 Market Street")
+	second := createSheet(t, srv, ada, "River flat", "2 Quay Lane")
+	uploadFile(t, srv, ada, first.ID, "a.pdf", []byte("%PDF-1.4\n"), "application/pdf")
+	uploadFile(t, srv, ada, second.ID, "b.pdf", []byte("%PDF-1.4\n"), "application/pdf")
+
+	if res := call(srv, http.MethodPost, "/api/jobs/"+first.ID+"/start", ada, nil, ""); res.Code != http.StatusOK {
+		t.Fatalf("first start %d: %s", res.Code, res.Body.String())
+	}
+	res := call(srv, http.MethodPost, "/api/jobs/"+second.ID+"/start", ada, nil, "")
+	if res.Code != http.StatusConflict {
+		t.Fatalf("second start %d, want 409", res.Code)
+	}
+	if got := decodeJob(t, call(srv, http.MethodGet, "/api/jobs/"+second.ID, ada, nil, "")); got.Status != "draft" || got.RunID != "" {
+		t.Fatalf("second sheet is %s with runId %q, want an untouched draft", got.Status, got.RunID)
+	}
+
+	// The rule is per account: another account may run its own sheet meanwhile.
+	grace := signUp(t, srv, "grace@example.com")
+	hers := createSheet(t, srv, grace, "Garden house", "7 Orchard Road")
+	uploadFile(t, srv, grace, hers.ID, "c.pdf", []byte("%PDF-1.4\n"), "application/pdf")
+	if res := call(srv, http.MethodPost, "/api/jobs/"+hers.ID+"/start", grace, nil, ""); res.Code != http.StatusOK {
+		t.Fatalf("other account start %d: %s", res.Code, res.Body.String())
+	}
+}
+
+func TestAFailedSheetStaysFailed(t *testing.T) {
+	srv, _ := newTestServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+	uploadFile(t, srv, cookie, job.ID, "brochure.pdf", []byte("%PDF-1.4\n"), "application/pdf")
+
+	// The worker, not the handler, fails a sheet; put the store in that state directly.
+	ctx := context.Background()
+	stored, err := srv.store.Job(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored.Status = "failed"
+	stored.Error = "Brochure is missing"
+	stored.RunID = board.NewID()
+	if err := srv.store.UpdateJob(ctx, stored); err != nil {
+		t.Fatal(err)
+	}
+
+	res := call(srv, http.MethodPost, "/api/jobs/"+job.ID+"/start", cookie, nil, "")
+	if res.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", res.Code, res.Body.String())
+	}
+	got := decodeJob(t, res)
+	if got.Status != "failed" || got.Error != "Brochure is missing" || got.RunID != stored.RunID {
+		t.Fatalf("got %s %q runId=%s, want the failed sheet unchanged", got.Status, got.Error, got.RunID)
+	}
+}
+
+func TestSomeoneElsesSheetIs404OnEveryRoute(t *testing.T) {
+	srv, _ := newTestServer(t)
+	ada := signUp(t, srv, "ada@example.com")
+	grace := signUp(t, srv, "grace@example.com")
+	job := createSheet(t, srv, ada, "Market loft", "10 Market Street")
+	uploadFile(t, srv, ada, job.ID, "brochure.pdf", []byte("%PDF-1.4\n"), "application/pdf")
+
+	if res := call(srv, http.MethodGet, "/api/jobs/"+job.ID, ada, nil, ""); res.Code != http.StatusOK {
+		t.Fatalf("owner cannot read own sheet: %d", res.Code)
+	}
+	routes := []struct{ method, path string }{
+		{http.MethodGet, "/api/jobs/" + job.ID},
+		{http.MethodPost, "/api/jobs/" + job.ID + "/file"},
+		{http.MethodPost, "/api/jobs/" + job.ID + "/start"},
+		{http.MethodGet, "/api/jobs/" + job.ID + "/file"},
+	}
+	for _, route := range routes {
+		res := call(srv, route.method, route.path, grace, nil, "")
+		if res.Code != http.StatusNotFound {
+			t.Fatalf("%s %s as another account: %d, want 404", route.method, route.path, res.Code)
+		}
+	}
+}
+
+func TestASecondUploadReturns400(t *testing.T) {
+	srv, dir := newTestServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+	uploadFile(t, srv, cookie, job.ID, "first.txt", []byte("first"), "text/plain")
+
+	res := uploadRaw(t, srv, cookie, job.ID, "second.txt", []byte("second"), "text/plain")
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400", res.Code)
+	}
+	userID := whoAmI(t, srv, cookie)
+	data, err := os.ReadFile(filepath.Join(dir, userID, job.ID, "body"))
+	if err != nil || string(data) != "first" {
+		t.Fatalf("stored body %q err=%v, want the first upload untouched", data, err)
+	}
+	if got := decodeJob(t, call(srv, http.MethodGet, "/api/jobs/"+job.ID, cookie, nil, "")); got.Filename != "first.txt" {
+		t.Fatalf("filename %q, want first.txt", got.Filename)
+	}
+}
+
+func TestUploadRejectsFilesOverOneMiBWithoutTouchingTheDisk(t *testing.T) {
+	srv, dir := newTestServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+
+	res := uploadRaw(t, srv, cookie, job.ID, "big.txt", bytes.Repeat([]byte("a"), maxBrochure+1), "text/plain")
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400", res.Code)
+	}
+	if files := filesUnder(t, dir); len(files) != 0 {
+		t.Fatalf("rejected upload left files behind: %v", files)
+	}
+	if got := decodeJob(t, call(srv, http.MethodGet, "/api/jobs/"+job.ID, cookie, nil, "")); got.Filename != "" {
+		t.Fatalf("filename %q, want empty", got.Filename)
+	}
+
+	// Exactly 1 MiB is still fine.
+	uploadFile(t, srv, cookie, job.ID, "limit.txt", bytes.Repeat([]byte("a"), maxBrochure), "text/plain")
+}
+
+func TestUploadDecidesTheTypeFromTheBytes(t *testing.T) {
+	srv, _ := newTestServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+	cases := []struct {
+		name        string
+		contentType string
+		data        []byte
+		want        int
+	}{
+		{"notes.txt", "text/plain", []byte("%PDF-1.7\n%\xe2\xe3\xcf\xd3\n"), http.StatusOK},             // PDF bytes win over header and extension
+		{"photo.png", "image/png", []byte("A plain text brochure."), http.StatusOK},                     // text bytes win over header and extension
+		{"scan.pdf", "application/pdf", []byte{0x89, 'P', 'N', 'G', 0x00, 0x0a}, http.StatusBadRequest}, // binary with NUL
+		{"nul.txt", "text/plain", []byte("ab\x00cd"), http.StatusBadRequest},                            // NUL inside text
+		{"bad.txt", "text/plain", []byte{0xff, 0xfe, 'x'}, http.StatusBadRequest},                       // invalid UTF-8
+		{"empty.txt", "text/plain", []byte{}, http.StatusBadRequest},                                    // empty
+	}
+	for _, c := range cases {
+		job := createSheet(t, srv, cookie, "Sheet "+c.name, "1 Test Street")
+		res := uploadRaw(t, srv, cookie, job.ID, c.name, c.data, c.contentType)
+		if res.Code != c.want {
+			t.Fatalf("%s (%s): status %d, want %d: %s", c.name, c.contentType, res.Code, c.want, res.Body.String())
+		}
+	}
+}
+
+func TestDownloadServesTheBrochureBytes(t *testing.T) {
+	srv, _ := newTestServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+	content := []byte("%PDF-1.4\n1 0 obj\n")
+	uploadFile(t, srv, cookie, job.ID, "../../escaped.pdf", content, "application/pdf")
+
+	res := call(srv, http.MethodGet, "/api/jobs/"+job.ID+"/file", cookie, nil, "")
+	if res.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", res.Code, res.Body.String())
+	}
+	if !bytes.Equal(res.Body.Bytes(), content) {
+		t.Fatal("downloaded bytes differ from the upload")
+	}
+	if cd := res.Header().Get("Content-Disposition"); cd != `attachment; filename="escaped.pdf"` {
+		t.Fatalf("Content-Disposition %q", cd)
+	}
+}
+
+func TestSheetJSONHasExactlyTheDocumentedFields(t *testing.T) {
+	srv, _ := newTestServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+
+	res := call(srv, http.MethodGet, "/api/jobs/"+job.ID, cookie, nil, "")
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(res.Body.Bytes(), &raw); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"id", "title", "address", "status", "error", "runId", "filename", "checklist", "createdAt"}
+	if len(raw) != len(want) {
+		t.Fatalf("sheet has %d fields, want %d: %v", len(raw), len(want), keys(raw))
+	}
+	for _, field := range want {
+		if _, ok := raw[field]; !ok {
+			t.Fatalf("field %q is missing", field)
+		}
+	}
+}
+
 func newTestServer(t *testing.T) (*Server, string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -107,6 +333,19 @@ func signUp(t *testing.T, srv *Server, email string) string {
 	return ""
 }
 
+func whoAmI(t *testing.T, srv *Server, cookie string) string {
+	t.Helper()
+	res := call(srv, http.MethodGet, "/api/me", cookie, nil, "")
+	if res.Code != http.StatusOK {
+		t.Fatalf("me %d: %s", res.Code, res.Body.String())
+	}
+	var acc account
+	if err := json.Unmarshal(res.Body.Bytes(), &acc); err != nil {
+		t.Fatal(err)
+	}
+	return acc.ID
+}
+
 func createSheet(t *testing.T, srv *Server, cookie, title, address string) board.Job {
 	t.Helper()
 	body := strings.NewReader(`{"title":"` + title + `","address":"` + address + `"}`)
@@ -118,6 +357,16 @@ func createSheet(t *testing.T, srv *Server, cookie, title, address string) board
 }
 
 func uploadFile(t *testing.T, srv *Server, cookie, id, name string, data []byte, contentType string) {
+	t.Helper()
+	res := uploadRaw(t, srv, cookie, id, name, data, contentType)
+	if res.Code != http.StatusOK {
+		t.Fatalf("upload %d: %s", res.Code, res.Body.String())
+	}
+}
+
+// uploadRaw sends a multipart upload and returns the response for tests that
+// expect a rejection.
+func uploadRaw(t *testing.T, srv *Server, cookie, id, name string, data []byte, contentType string) *httptest.ResponseRecorder {
 	t.Helper()
 	var buf bytes.Buffer
 	writer := multipart.NewWriter(&buf)
@@ -134,10 +383,7 @@ func uploadFile(t *testing.T, srv *Server, cookie, id, name string, data []byte,
 	if err := writer.Close(); err != nil {
 		t.Fatal(err)
 	}
-	res := call(srv, http.MethodPost, "/api/jobs/"+id+"/file", cookie, &buf, writer.FormDataContentType())
-	if res.Code != http.StatusOK {
-		t.Fatalf("upload %d: %s", res.Code, res.Body.String())
-	}
+	return call(srv, http.MethodPost, "/api/jobs/"+id+"/file", cookie, &buf, writer.FormDataContentType())
 }
 
 func decodeJob(t *testing.T, res *httptest.ResponseRecorder) board.Job {
@@ -147,6 +393,41 @@ func decodeJob(t *testing.T, res *httptest.ResponseRecorder) board.Job {
 		t.Fatal(err)
 	}
 	return job
+}
+
+func errorText(t *testing.T, res *httptest.ResponseRecorder) string {
+	t.Helper()
+	var body map[string]string
+	if err := json.Unmarshal(res.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	return body["error"]
+}
+
+func filesUnder(t *testing.T, dir string) []string {
+	t.Helper()
+	var files []string
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() {
+			files = append(files, path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return files
+}
+
+func keys(m map[string]json.RawMessage) []string {
+	var out []string
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }
 
 func call(srv *Server, method, path, cookie string, body io.Reader, contentType string) *httptest.ResponseRecorder {

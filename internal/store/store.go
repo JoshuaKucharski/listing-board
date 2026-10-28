@@ -37,6 +37,23 @@ func Open(dsn string) (*Store, error) {
 	return s, nil
 }
 
+// OpenWithRetry calls Open until it succeeds or wait has passed. In docker
+// compose the API and the worker start next to Postgres, which may still be
+// booting for the first seconds.
+func OpenWithRetry(dsn string, wait time.Duration) (*Store, error) {
+	deadline := time.Now().Add(wait)
+	for {
+		st, err := Open(dsn)
+		if err == nil {
+			return st, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, err
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
 func (s *Store) Close() error {
 	return s.db.Close()
 }
@@ -95,7 +112,17 @@ func (s *Store) UserByToken(ctx context.Context, token string) (board.User, erro
 }
 
 func (s *Store) ListJobs(ctx context.Context, userID string) ([]board.Job, error) {
-	rows, err := s.db.QueryContext(ctx, jobSelect+` WHERE user_id = $1 ORDER BY created_at DESC`, userID)
+	return s.queryJobs(ctx, `WHERE user_id = $1 ORDER BY created_at DESC`, userID)
+}
+
+// RunningJobs returns the sheets in "running" across all accounts, oldest
+// first. The worker uses it to find work.
+func (s *Store) RunningJobs(ctx context.Context) ([]board.Job, error) {
+	return s.queryJobs(ctx, `WHERE status = 'running' ORDER BY created_at`)
+}
+
+func (s *Store) queryJobs(ctx context.Context, where string, args ...any) ([]board.Job, error) {
+	rows, err := s.db.QueryContext(ctx, jobSelect+" "+where, args...)
 	if err != nil {
 		return nil, err
 	}

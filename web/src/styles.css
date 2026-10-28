@@ -2,6 +2,14 @@
   color: #1c1915;
   background: #f4f1ea;
   font-family: Palatino, "Iowan Old Style", Georgia, serif;
+  --ink: #1c1915;
+  --paper: #fff;
+  --line: #d9d2c5;
+  --muted: #6d675e;
+  --ok: #3d6b45;
+  --warn: #8a6d1f;
+  --bad: #8c3a2f;
+  --radius: 18px;
 }
 
 body {
@@ -33,6 +41,7 @@ header {
 .layout {
   grid-template-columns: 280px 1fr;
   margin-top: 28px;
+  align-items: start;
 }
 
 .narrow {
@@ -54,18 +63,30 @@ label {
 
 input {
   font: inherit;
-  padding: 8px 10px;
-  border: 1px solid #d9d2c5;
-  background: #fff;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--paper);
+}
+
+input:focus-visible, button:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
 }
 
 button {
   font: inherit;
-  padding: 8px 14px;
-  border: 1px solid #1c1915;
-  background: #1c1915;
+  padding: 10px 18px;
+  border: 1px solid var(--ink);
+  border-radius: 999px;
+  background: var(--ink);
   color: #f4f1ea;
   cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.6;
+  cursor: progress;
 }
 
 button.ghost, button.row {
@@ -77,12 +98,17 @@ button.row {
   width: 100%;
   display: flex;
   justify-content: space-between;
+  align-items: center;
   gap: 12px;
   text-align: left;
+  border-color: var(--line);
+  border-radius: 14px;
+  padding: 12px 14px;
 }
 
 button.row.on {
-  background: #fff;
+  background: var(--paper);
+  border-color: var(--ink);
 }
 
 .list {
@@ -94,31 +120,167 @@ button.row.on {
 }
 
 .sheet {
-  background: #fff;
-  border: 1px solid #d9d2c5;
-  padding: 20px;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 24px;
 }
 
-ol {
-  padding-left: 18px;
+.sheet-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: start;
+  gap: 16px;
+  margin-bottom: 12px;
 }
 
-li.done {
-  color: #3d6b45;
+.file {
+  font-size: 14px;
+  color: var(--muted);
+  margin: 0 0 16px;
+  word-break: break-all;
+}
+
+/* Progress: a track that fills one third per finished step, then the steps themselves. */
+.track {
+  height: 6px;
+  border-radius: 999px;
+  background: #ece6da;
+  overflow: hidden;
+  margin: 20px 0 16px;
+}
+
+.track-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: var(--ok);
+  transition: width 600ms ease;
+}
+
+.steps {
+  list-style: none;
+  margin: 0 0 20px;
+  padding: 0;
+  display: grid;
+  gap: 10px;
+}
+
+.step {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: var(--muted);
+}
+
+.step.active {
+  color: var(--ink);
+}
+
+.step.done {
+  color: var(--ok);
+}
+
+.mark {
+  flex: none;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 1.5px solid var(--line);
+  display: inline-grid;
+  place-items: center;
+  font-size: 13px;
+  box-sizing: border-box;
+}
+
+.step.done .mark {
+  border-color: var(--ok);
+  background: var(--ok);
+  color: #fff;
+  animation: pop 320ms ease-out;
+}
+
+/* The active step shows a spinner instead of a number. */
+.step.active .mark {
+  border-color: var(--line);
+  border-top-color: var(--ink);
+  animation: spin 900ms linear infinite;
+}
+
+.done-note {
+  color: var(--ok);
+  margin: 0;
+  animation: rise 500ms ease-out;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes pop {
+  0% { transform: scale(0.6); }
+  60% { transform: scale(1.12); }
+  100% { transform: scale(1); }
+}
+
+@keyframes rise {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .track-fill, .step.done .mark, .done-note {
+    animation: none;
+    transition: none;
+  }
+  .step.active .mark {
+    animation: none;
+    border-top-color: var(--line);
+    background: var(--ink);
+  }
 }
 
 .muted, .status {
   display: block;
-  color: #6d675e;
+  color: var(--muted);
   font-size: 14px;
 }
 
-.status.success {
-  color: #3d6b45;
+.status {
+  flex: none;
+  display: inline-block;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--paper);
+  line-height: 1.4;
 }
 
-.status.failed, .error {
-  color: #8c3a2f;
+.status.running {
+  color: var(--warn);
+  border-color: currentColor;
+}
+
+.status.success {
+  color: var(--ok);
+  border-color: currentColor;
+}
+
+.status.failed {
+  color: var(--bad);
+  border-color: currentColor;
+}
+
+.error {
+  color: var(--bad);
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
 }
 
 @media (max-width: 720px) {

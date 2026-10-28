@@ -1,6 +1,8 @@
 package httpapi
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -11,13 +13,21 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/crypto/bcrypt"
 
 	"listingboard/internal/board"
 )
 
-const sessionCookie = "lb_session"
+const (
+	sessionCookie = "lb_session"
+	// maxBrochure is the largest brochure accepted, 1 MiB.
+	maxBrochure = 1 << 20
+	// bodyFile is the fixed file name under {DATA_DIR}/{userID}/{jobID}. The
+	// client's filename is kept as data on the sheet and never used as a path.
+	bodyFile = "body"
+)
 
 type Server struct {
 	store   board.Store
@@ -201,84 +211,95 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.current(w, r); !ok {
+	user, ok := s.current(w, r)
+	if !ok {
 		return
 	}
-	job, ok := s.load(w, r)
+	job, ok := s.load(w, r, user)
 	if !ok {
 		return
 	}
 	writeJSON(w, http.StatusOK, job)
 }
 
+// upload accepts the one brochure a sheet may have. The type is decided from
+// the bytes, the size limit is enforced before anything touches the disk, and
+// the bytes are stored under a fixed name so the client's filename can never
+// escape the data directory.
 func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.current(w, r); !ok {
-		return
-	}
-	job, ok := s.load(w, r)
+	user, ok := s.current(w, r)
 	if !ok {
 		return
 	}
-	if err := r.ParseMultipartForm(8 << 20); err != nil {
-		writeErr(w, http.StatusBadRequest, "Brochure upload was incomplete")
+	job, ok := s.load(w, r, user)
+	if !ok {
 		return
 	}
-	file, header, err := r.FormFile("file")
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "Choose a brochure file")
+	if job.Filename != "" {
+		writeErr(w, http.StatusBadRequest, "This sheet already has a brochure")
 		return
 	}
-	defer file.Close()
-	name := filenameFromHeader(header)
-	if strings.TrimSpace(name) == "" || !headerAllows(name, header.Header.Get("Content-Type")) {
+	name, data, reject := readBrochure(w, r)
+	if reject != "" {
+		writeErr(w, http.StatusBadRequest, reject)
+		return
+	}
+	if !brochureAllowed(data) {
 		writeErr(w, http.StatusBadRequest, "Brochure must be a PDF or a text file")
 		return
 	}
-	data, err := io.ReadAll(io.LimitReader(file, 8<<20+1))
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "Brochure upload was incomplete")
-		return
-	}
-	if len(data) > 8<<20 {
-		writeErr(w, http.StatusBadRequest, "Brochure is too large")
-		return
-	}
-	dir := filepath.Join(s.dataDir, job.ID)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		writeErr(w, http.StatusInternalServerError, "Could not store the brochure")
-		return
-	}
-	dst := filepath.Join(dir, name)
-	if err := os.WriteFile(dst, data, 0o644); err != nil {
+	path := s.bodyPath(job)
+	if err := writeFile(path, data); err != nil {
 		writeErr(w, http.StatusInternalServerError, "Could not store the brochure")
 		return
 	}
 	job.Filename = name
 	job.UpdatedAt = time.Now().UTC()
 	if err := s.store.UpdateJob(r.Context(), job); err != nil {
+		_ = os.Remove(path)
 		writeErr(w, http.StatusInternalServerError, "Could not store the brochure")
 		return
 	}
 	writeJSON(w, http.StatusOK, job)
 }
 
+// start moves a draft to "running" and hands it to the worker. The runId is
+// chosen here, once; the worker never changes it, so a restart continues the
+// same run. The handler never sets "success" or "failed".
 func (s *Server) start(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.current(w, r); !ok {
+	user, ok := s.current(w, r)
+	if !ok {
 		return
 	}
-	job, ok := s.load(w, r)
+	job, ok := s.load(w, r, user)
 	if !ok {
+		return
+	}
+	switch job.Status {
+	case "running", "success", "failed":
+		// Starting again changes nothing: a running sheet keeps its runId,
+		// a finished sheet stays finished, a failed sheet stays failed.
+		writeJSON(w, http.StatusOK, job)
 		return
 	}
 	if strings.TrimSpace(job.Filename) == "" {
 		writeErr(w, http.StatusBadRequest, "Attach a brochure first")
 		return
 	}
-	job.Status = "success"
+	busy, err := s.otherSheetRunning(r.Context(), user.ID, job.ID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "Could not start the sheet")
+		return
+	}
+	if busy {
+		writeErr(w, http.StatusConflict, "Another sheet is already running")
+		return
+	}
+	job.Status = "running"
 	job.RunID = board.NewID()
 	job.Error = ""
 	for i := range job.Checklist {
-		job.Checklist[i].State = "done"
+		job.Checklist[i].State = "pending"
 	}
 	job.UpdatedAt = time.Now().UTC()
 	if err := s.store.UpdateJob(r.Context(), job); err != nil {
@@ -288,11 +309,27 @@ func (s *Server) start(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, job)
 }
 
+// otherSheetRunning reports whether the account has a sheet other than
+// exceptID in "running". One running sheet per account at a time.
+func (s *Server) otherSheetRunning(ctx context.Context, userID, exceptID string) (bool, error) {
+	jobs, err := s.store.ListJobs(ctx, userID)
+	if err != nil {
+		return false, err
+	}
+	for _, other := range jobs {
+		if other.ID != exceptID && other.Status == "running" {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (s *Server) download(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.current(w, r); !ok {
+	user, ok := s.current(w, r)
+	if !ok {
 		return
 	}
-	job, ok := s.load(w, r)
+	job, ok := s.load(w, r, user)
 	if !ok {
 		return
 	}
@@ -300,19 +337,29 @@ func (s *Server) download(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "Not found")
 		return
 	}
-	f, err := os.Open(filepath.Join(s.dataDir, job.ID, job.Filename))
+	f, err := os.Open(s.bodyPath(job))
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "Not found")
 		return
 	}
 	defer f.Close()
-	w.Header().Set("Content-Disposition", "attachment; filename="+strconvQuote(filepath.Base(job.Filename)))
-	http.ServeContent(w, r, filepath.Base(job.Filename), job.UpdatedAt, f)
+	name := filepath.Base(job.Filename)
+	w.Header().Set("Content-Disposition", "attachment; filename="+strconvQuote(name))
+	http.ServeContent(w, r, name, job.UpdatedAt, f)
 }
 
-func (s *Server) load(w http.ResponseWriter, r *http.Request) (board.Job, bool) {
+// bodyPath is {DATA_DIR}/{userID}/{jobID}/body. Both ids are generated hex,
+// so the path is built from trusted parts only.
+func (s *Server) bodyPath(job board.Job) string {
+	return filepath.Join(s.dataDir, job.UserID, job.ID, bodyFile)
+}
+
+// load fetches the sheet named in the URL for the signed-in user. A sheet
+// that does not exist and a sheet that belongs to someone else both answer
+// 404, so ids cannot be probed.
+func (s *Server) load(w http.ResponseWriter, r *http.Request, user board.User) (board.Job, bool) {
 	job, err := s.store.Job(r.Context(), r.PathValue("id"))
-	if errors.Is(err, board.ErrNotFound) {
+	if errors.Is(err, board.ErrNotFound) || (err == nil && job.UserID != user.ID) {
 		writeErr(w, http.StatusNotFound, "Not found")
 		return board.Job{}, false
 	}
@@ -353,23 +400,87 @@ func (s *Server) openSession(w http.ResponseWriter, r *http.Request, user board.
 	return nil
 }
 
-func filenameFromHeader(header *multipart.FileHeader) string {
-	_, params, err := mime.ParseMediaType(header.Header.Get("Content-Disposition"))
+// readBrochure streams the multipart field "file" into memory without going
+// through a temporary file. It returns the client's filename, the bytes, and
+// a message when the upload must be rejected with 400. The body is capped at
+// the brochure limit plus room for the multipart framing, so an oversized
+// upload is cut off early instead of being read to the end.
+func readBrochure(w http.ResponseWriter, r *http.Request) (name string, data []byte, reject string) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBrochure+(64<<10))
+	mr, err := r.MultipartReader()
+	if err != nil {
+		return "", nil, "Choose a brochure file"
+	}
+	for {
+		part, err := mr.NextPart()
+		if errors.Is(err, io.EOF) {
+			return "", nil, "Choose a brochure file"
+		}
+		if err != nil {
+			return "", nil, "Brochure upload was incomplete"
+		}
+		if part.FormName() != "file" {
+			_ = part.Close()
+			continue
+		}
+		name = filenameFromPart(part)
+		data, err = io.ReadAll(io.LimitReader(part, maxBrochure+1))
+		_ = part.Close()
+		if err != nil {
+			return "", nil, "Brochure upload was incomplete"
+		}
+		if len(data) > maxBrochure {
+			return "", nil, "Brochure is too large"
+		}
+		if strings.TrimSpace(name) == "" {
+			return "", nil, "Choose a brochure file"
+		}
+		return name, data, ""
+	}
+}
+
+// filenameFromPart returns the filename exactly as the client sent it. It is
+// stored on the sheet as data only; see bodyPath for what reaches the disk.
+func filenameFromPart(part *multipart.Part) string {
+	_, params, err := mime.ParseMediaType(part.Header.Get("Content-Disposition"))
 	if err == nil {
 		if name := strings.TrimSpace(params["filename"]); name != "" {
 			return name
 		}
 	}
-	return header.Filename
+	return part.FileName()
 }
 
-func headerAllows(name, contentType string) bool {
-	ct := strings.ToLower(contentType)
-	lower := strings.ToLower(name)
-	if strings.Contains(ct, "pdf") || strings.Contains(ct, "text/plain") {
+// brochureAllowed decides the type from the bytes alone. The multipart
+// Content-Type and the file extension are not consulted.
+//   - PDF: the bytes start with "%PDF-".
+//   - Text: the whole file is valid UTF-8 and contains no NUL byte.
+//   - Anything else, including an empty file, is rejected.
+func brochureAllowed(data []byte) bool {
+	if len(data) == 0 {
+		return false
+	}
+	if bytes.HasPrefix(data, []byte("%PDF-")) {
 		return true
 	}
-	return strings.HasSuffix(lower, ".pdf") || strings.HasSuffix(lower, ".txt")
+	return utf8.Valid(data) && bytes.IndexByte(data, 0) < 0
+}
+
+// writeFile writes data to path through a temporary name in the same
+// directory, so a crash mid-write never leaves a half brochure behind.
+func writeFile(path string, data []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 func decode(w http.ResponseWriter, r *http.Request, dst any) error {
